@@ -103,14 +103,10 @@ class MigrationRunner:
             raise MigrationDefinitionError(
                 "migrations must be a finite sequence of Migration values."
             )
-        if len(migrations) > _MAX_MIGRATIONS:
-            raise MigrationDefinitionError(
-                "A migration set cannot contain more than 10,000 entries."
-            )
         if not isinstance(table, str) or _IDENTIFIER.fullmatch(table) is None:
             raise MigrationDefinitionError("History table must be a valid SQL identifier.")
 
-        definitions = tuple(migrations)
+        definitions = _copy_bounded_migrations(migrations)
         if any(not isinstance(migration, Migration) for migration in definitions):
             raise MigrationDefinitionError("Every migration must be a Migration value.")
         versions = [migration.version for migration in definitions]
@@ -226,3 +222,15 @@ __all__ = [
     "MigrationRunner",
     "MigrationStateError",
 ]
+
+
+def _copy_bounded_migrations(migrations: Sequence[Migration]) -> tuple[Migration, ...]:
+    """Copy a migration sequence without trusting a custom sequence's reported length."""
+    definitions: list[Migration] = []
+    iterator = iter(migrations)
+    for _ in range(_MAX_MIGRATIONS + 1):
+        try:
+            definitions.append(next(iterator))
+        except StopIteration:
+            return tuple(definitions)
+    raise MigrationDefinitionError("A migration set cannot contain more than 10,000 entries.")

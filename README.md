@@ -66,7 +66,7 @@ ruff check .
 mypy
 ```
 
-This package is pre-alpha and its API is not stable. It supports Python 3.11 through 3.14.
+This package is in alpha and its API is not stable. It supports Python 3.11 through 3.14.
 
 Licensed under Apache-2.0.
 

@@ -14,6 +14,7 @@
 """Exercise migration ordering, idempotence, history validation, and rollback behavior."""
 
 import asyncio
+from collections.abc import Iterator, Sequence
 
 import pytest
 from orbit_sql import SQLTransaction
@@ -237,3 +238,33 @@ def test_duplicate_versions_and_unsafe_history_names_are_rejected() -> None:
         )
     with pytest.raises(MigrationDefinitionError, match="SQL identifier"):
         MigrationRunner(SQLiteDatabase(":memory:"), [], table="history; DROP TABLE users")
+
+
+def test_migration_sequence_length_cannot_bypass_iteration_bound() -> None:
+    """Custom Sequence implementations cannot hide an oversized migration iterator."""
+
+    async def noop(transaction: SQLTransaction) -> None:
+        del transaction
+
+    class LyingSequence(Sequence[Migration]):
+        observed = 0
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int | slice) -> Migration | tuple[Migration, ...]:
+            if isinstance(index, slice):
+                raise TypeError("slice access is unsupported")
+            self.observed += 1
+            return Migration(index + 1, f"migration_{index + 1}", noop)
+
+        def __iter__(self) -> Iterator[Migration]:
+            index = 0
+            while True:
+                yield self[index]  # type: ignore[misc]
+                index += 1
+
+    migrations = LyingSequence()
+    with pytest.raises(MigrationDefinitionError, match="more than 10,000"):
+        MigrationRunner(SQLiteDatabase(":memory:"), migrations)
+    assert migrations.observed == 10_001

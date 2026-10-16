@@ -1,70 +1,54 @@
-# Orbit Migrations: operations and security
+# Orbit Migrations operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+Run schema migrations as an explicit deployment step with the matching application release and
+database provider. The runner does not migrate at application startup and should not be started by
+every web worker or replica.
 
-## Configuration surface
+## Deployment sequence
 
-Environment names found in the package README:
+1. Build and review the migration definitions as part of the release artifact.
+2. Back up the target database and verify the restore procedure for high-value data.
+3. Ensure exactly one deployment actor owns the migration run. The in-process lock only protects
+   calls through one `MigrationRunner` instance; use CI/deployment serialization or a
+   provider-specific advisory lock for cross-process exclusion.
+4. Run `apply_pending()` with the intended package version and database credentials.
+5. Check the returned versions and database state before rolling out application replicas that
+   depend on the new schema.
+6. Close the database resource through the code that created it.
 
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
+The runner is forward-only. For compatible zero-downtime changes, use an expand/migrate/contract
+rollout: add backward-compatible schema first, deploy code that can handle both states, backfill in
+a separately controlled bounded job, then remove obsolete schema only in a later release after all
+old code is gone. Backfills can be long-running and should not be hidden inside a schema migration.
 
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
+## Transaction and partial failure
 
-## Lifecycle, failure behavior, and limits
+Each migration callback and its history row share one `SQLTransaction`; successful earlier
+migrations remain committed if a later version fails. The failed callback raises a generic
+`MigrationExecutionError` and is expected to roll back through the database transaction context.
+Cancellation propagates so the transaction context can perform its cleanup.
 
-`orbit-migrations` is an optional, explicit migration runner for the provider-neutral `orbit-sql`
-contract. Install one SQL provider separately, such as SQLite for local development; the migration
-package does not install a database driver, ORM, or web framework.
+Some databases or DDL operations commit implicitly or cannot roll back all schema changes. Test
+each migration on the same backend and version used in deployment. After an interruption, inspect
+both schema and `orbit_schema_migrations` before rerunning. Do not manually insert history rows to
+make the runner skip uncertain or partially applied changes; write a reviewed repair or follow the
+database recovery plan.
 
-```bash
-python -m pip install orbit-data orbit-sql orbit-sql-sqlite orbit-migrations
-```
+## Resource and configuration limits
 
-Define ordered, asynchronous migration callbacks and give them to a runner:
+The runner accepts at most 10,000 migrations and at most 10,000 history entries. Versions are
+positive signed 64-bit integers and must be unique. The default history table is
+`orbit_schema_migrations`; custom names must match `[A-Za-z_][A-Za-z0-9_]{0,62}`. Each migration
+name is printable text up to 255 characters. These limits bound runner metadata, not the SQL
+runtime, DDL cost, lock duration, table size, or backfill workload.
 
-```python
-import asyncio
+Migration callbacks should use the transaction passed to them. Avoid reaching around it through a
+second connection, because those changes will not share the callback's transaction and may persist
+even when the history insert rolls back.
 
-from orbit_sql import SQLTransaction
-from orbit_sql_sqlite import SQLiteDatabase
-from orbit_migrations import Migration, MigrationRunner
+## Provider validation
 
-
-async def create_notes(transaction: SQLTransaction) -> None:
-    await transaction.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
-
-
-async def main() -> None:
-    database = SQLiteDatabase("var/orbit.db")
-    runner = MigrationRunner(database, [Migration(1, "create_notes", create_notes)])
-    try:
-        applied_versions = await runner.apply_pending()
-        print(applied_versions)
-    finally:
-        await database.aclose()
-
-
-asyncio.run(main())
-```
-
-Each migration and its history record run in one database transaction. A failed migration rolls
-back and raises a sanitized `MigrationExecutionError`; cancellation propagates after the database
-transaction has rolled back. Reapplying a migration set is safe: already-recorded versions are
-skipped, while unknown versions, changed names, or missing earlier versions fail closed. Migration
-versions are positive, unique integers and are applied in ascending order.
-The recorded history is bounded to 10,000 entries; oversized or duplicate legacy history fails
-closed before a new migration runs.
-
-Run migrations as a deliberate deployment step before starting or scaling application workers.
-Only one migration runner may operate on a database at a time: the runner serializes calls made
-through one instance but does not acquire a distributed/advisory lock across processes. Migration
-callbacks are application code and should use only the provided transaction. Do not place secrets
-in migration names or SQL literals.
-
-The history table defaults to `orbit_schema_migrations` and can be changed using a validated SQL
-identifier. This package is forward-only; it does not execute destructive downgrades or discover
-migration modules automatically.
-
-## Production validation
-
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Verify driver/database compatibility, transaction isolation, DDL rollback semantics, lock behavior,
+statement timeouts, long-running lock impact, backup/restore, migration-runner exclusion, and
+rolling application compatibility against the chosen backend. This package's local SQLite tests do
+not certify PostgreSQL or MySQL behavior or the target deployment's safety.
